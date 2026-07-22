@@ -16,7 +16,12 @@ from gemini_client import call_gemini_api
 # =====================================================================
 # 🌲 [LightGBM] 저장된 예측 모델 및 Feature Importance 로드
 # =====================================================================
-MODEL_PATH = "lightgbm_pm10_model.pkl"
+
+
+# =====================================================================
+# 🔧 [수정] 파일이 있는 현재 위치를 기준으로 절대 경로를 자동 생성합니다.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "lightgbm_pm10_model.pkl")
 
 @st.cache_resource
 def load_lgbm_model():
