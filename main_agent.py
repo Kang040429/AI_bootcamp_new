@@ -4,46 +4,217 @@ import time
 import urllib.parse
 import requests
 import random
+import re
 import pandas as pd
+import numpy as np
+import joblib
 import streamlit as st
+from bs4 import BeautifulSoup
 from gemini_client import call_gemini_api
 
 
 # =====================================================================
-# 🛡️ [DEBUG 강화] HTTP 요청 및 에러 콘솔 출력 함수
+# 🌲 [LightGBM] 저장된 예측 모델 및 Feature Importance 로드
 # =====================================================================
-def safe_requests_get(url: str, params: dict, max_retries: int = 3) -> requests.Response:
-    """
-    HTTP 요청 시 429(Rate Limit) 또는 네트워크 에러가 발생하면
-    지수 백오프(Exponential Backoff) 방식으로 대기 후 자동 재시도하며 상세 에러를 CMD에 출력합니다.
-    """
-    delay = 1.0  # 첫 대기시간 1초
-    for attempt in range(max_retries):
-        try:
-            res = requests.get(url, params=params, timeout=10)
-            
-            # HTTP 200 성공이 아닌 경우 상태 코드 CMD 출력
-            if res.status_code != 200:
-                print(f"🚨 [API 요청 에러] URL: {url.split('/')[-1]} | Status: {res.status_code} | Body: {res.text[:150]}")
+MODEL_PATH = "lightgbm_pm10_model.pkl"
 
-            # 429 에러(Rate Limit) 발생 시 재시도
-            if res.status_code == 429:
-                print(f"⚠️ [API 429 제한 발생] {delay}초 대기 후 재시도합니다... ({attempt + 1}/{max_retries})")
-                time.sleep(delay)
-                delay *= 2  # 대기 시간 2배 증가
-                break
-                
-            return res
+@st.cache_resource
+def load_lgbm_model():
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+            print("✅ [LightGBM] 모델 로드 성공!")
+            return model
         except Exception as e:
-            print(f"❌ [HTTP 요청 예외 발생] URL: {url.split('/')[-1]} | Error: {e}")
-            time.sleep(delay)
-            delay *= 2
-            
+            print(f"❌ [LightGBM] 모델 로드 실패: {e}")
+    else:
+        print(f"⚠️ [LightGBM] '{MODEL_PATH}' 파일이 경로에 없습니다. ML 예측을 건너뜁니다.")
     return None
 
+lgb_model = load_lgbm_model()
+
+# 특성 중요도 사전 계산 (%)
+FEATURE_COLS = ['지역_규모', '계절_가중치', '아황산가스(SO2)', '일산화탄소(CO)', '오존(O3)', '이산화질소(NO2)']
+FEATURE_IMPORTANCES = {}
+
+if lgb_model is not None:
+    try:
+        raw_imps = lgb_model.feature_importances_
+        imp_sum = np.sum(raw_imps)
+        if imp_sum > 0:
+            imp_ratios = (raw_imps / imp_sum) * 100
+            FEATURE_IMPORTANCES = {col: round(ratio, 1) for col, ratio in zip(FEATURE_COLS, imp_ratios)}
+    except Exception as e:
+        print(f"⚠️ [LightGBM] 특성 중요도 계산 중 예외 발생: {e}")
+
+
+def predict_pm10_with_explanation(air_data: dict) -> dict:
+    """
+    대기질 수집 결과(SO2, CO, O3, NO2 등)를 LightGBM 모델 입력 형식으로 변환하여 PM10을 예측합니다.
+    """
+    if lgb_model is None:
+        return None
+
+    try:
+        so2 = float(air_data.get("so2", 0.003)) if air_data.get("so2") not in [None, "-"] else 0.003
+        co = float(air_data.get("co", 0.5)) if air_data.get("co") not in [None, "-"] else 0.5
+        o3 = float(air_data.get("o3", 0.030)) if air_data.get("o3") not in [None, "-"] else 0.030
+        no2 = float(air_data.get("no2", 0.025)) if air_data.get("no2") not in [None, "-"] else 0.025
+        
+        month = pd.Timestamp.now().month
+        season_weight = 1.0 if month in [12, 1, 2, 6, 7, 8] else 0.0
+        
+        sido = air_data.get("sido", "")
+        region_scale = 3 if any(k in sido for k in ["서울", "경기", "인천", "부산", "대구"]) else 2
+
+        input_df = pd.DataFrame([{
+            '지역_규모': region_scale,
+            '계절_가중치': season_weight,
+            '아황산가스(SO2)': so2,
+            '일산화탄소(CO)': co,
+            '오존(O3)': o3,
+            '이산화질소(NO2)': no2
+        }])
+
+        predicted_pm10 = float(round(lgb_model.predict(input_df)[0], 1))
+
+        top_3_str = "분석 불요"
+        if FEATURE_IMPORTANCES:
+            top_3_factors = sorted(FEATURE_IMPORTANCES.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_3_str = ", ".join([f"{feat}({score}%)" for feat, score in top_3_factors])
+
+        return {
+            "ml_predicted_pm10": predicted_pm10,
+            "top_contributing_factors": top_3_str,
+            "model_type": "LightGBM (비선형 트리 기반 Machine Learning)"
+        }
+    except Exception as e:
+        print(f"❌ [LightGBM 예측 수행 실패]: {e}")
+        return None
+
 
 # =====================================================================
-# [PRE-STEP] 국가데이터처 CSV 기반 위치 마스터 로드 및 매핑 딕셔너리 생성
+# 🕸️ [크롤링 모듈] 네이버 실시간 기온, 미세먼지, 초미세, 자외선 수집
+# =====================================================================
+def get_naver_weather_with_numbers(location_name: str) -> dict:
+    """
+    네이버 검색을 통해 [현재 온도, 미세먼지, 초미세먼지, 자외선]을 수치 및 상태로 수집합니다.
+    """
+    query = urllib.parse.quote(f"{location_name} 날씨")
+    url = f"https://search.naver.com/search.naver?query={query}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # 1. 현재 온도
+        temp_val = 22.0
+        temp_elem = soup.select_one(".temperature_text strong, .weather_graph .temperature_text strong")
+        if temp_elem:
+            temp_raw = temp_elem.get_text().replace("현재 온도", "").replace("°", "").strip()
+            match = re.search(r"[-+]?\d*\.\d+|\d+", temp_raw)
+            if match:
+                temp_val = float(match.group())
+
+        # 2. 미세먼지/초미세/자외선/오존 영역
+        chart_items = soup.select(".today_chart_box .item_today, .item_today")
+
+        metrics = {
+            "미세먼지": {"status": "보통", "value": None},
+            "초미세먼지": {"status": "보통", "value": None},
+            "자외선": {"status": "보통", "value": None},
+            "오존": {"status": "보통", "value": None}
+        }
+
+        for item in chart_items:
+            title_elem = item.select_one(".title, .item_title")
+            txt_elem = item.select_one(".txt, .item_txt, .value")
+
+            if title_elem and txt_elem:
+                title = title_elem.get_text().strip()
+                full_text = txt_elem.get_text().strip()
+
+                num_match = re.search(r"\d+(\.\d+)?", full_text)
+                num_val = float(num_match.group()) if num_match else None
+
+                status_text = re.sub(r"[\d\.\s㎍/㎥ppm]", "", full_text).strip()
+                if not status_text:
+                    status_text = full_text
+
+                target_key = None
+                if "미세먼지" in title and "초" not in title:
+                    target_key = "미세먼지"
+                elif "초미세먼지" in title:
+                    target_key = "초미세먼지"
+                elif "자외선" in title:
+                    target_key = "자외선"
+                elif "오존" in title:
+                    target_key = "오존"
+
+                if target_key:
+                    metrics[target_key]["status"] = status_text if status_text else "보통"
+                    metrics[target_key]["value"] = num_val
+
+        # 3. 수치 보정
+        pm10_num = metrics["미세먼지"]["value"]
+        if pm10_num is None:
+            status_map = {"좋음": 20, "보통": 45, "나쁨": 90, "매우나쁨": 160, "매우 나쁨": 160}
+            pm10_num = status_map.get(metrics["미세먼지"]["status"], 45)
+
+        pm25_num = metrics["초미세먼지"]["value"]
+        if pm25_num is None:
+            status_map = {"좋음": 10, "보통": 23, "나쁨": 55, "매우나쁨": 85, "매우 나쁨": 85}
+            pm25_num = status_map.get(metrics["초미세먼지"]["status"], 23)
+
+        return {
+            "temperature": temp_val,
+            "pm10": int(pm10_num),
+            "status_pm10": metrics["미세먼지"]["status"],
+            "pm25": int(pm25_num),
+            "status_pm25": metrics["초미세먼지"]["status"],
+            "uv_num": metrics["자외선"]["value"],
+            "status_uv": metrics["자외선"]["status"],
+            "status_o3": metrics["오존"]["status"]
+        }
+
+    except Exception as e:
+        print(f"❌ [네이버 크롤링 실패]: {e}")
+        return None
+
+
+# =====================================================================
+# 🛡️ [API 예외 시 즉시 크롤링 전환] HTTP 요청 함수
+# =====================================================================
+def safe_requests_get(url: str, params: dict) -> requests.Response:
+    """
+    API 요청 실패 시 대기 및 재시도 없이 즉시 None을 반환하여
+    크롤링 단계로 빠르게 전환되도록 합니다.
+    """
+    try:
+        res = requests.get(url, params=params, timeout=3)
+        if res.status_code == 200:
+            return res
+        else:
+            print(f"🚨 [API 접속 실패] URL: {url.split('/')[-1]} | Status: {res.status_code} -> 즉시 크롤링으로 전환합니다.")
+            return None
+    except Exception as e:
+        print(f"❌ [HTTP 요청 예외 발생] URL: {url.split('/')[-1]} | Error: {e} -> 즉시 크롤링으로 전환합니다.")
+        return None
+
+
+# =====================================================================
+# [PRE-STEP] 국가데이터처 CSV 기반 위치 마스터 로드 및 매핑
 # =====================================================================
 @st.cache_data
 def locations_upload():
@@ -130,13 +301,7 @@ def get_beobjong_from_map(sido: str, sigungu: str, umd_name: str, h2b_map: dict,
     return umd_name
 
 
-# =====================================================================
-# ✨ [NEW] 즐겨찾기 선택 지역명 자동 결합 함수
-# =====================================================================
 def combine_user_input_with_location(user_input: str, selected_location: str = None) -> str:
-    """
-    선택된 즐겨찾기 지역명이 존재하는 경우, 사용자 질문 앞에 결합하여 Gemini가 인식할 수 있게 변환합니다.
-    """
     if selected_location:
         selected_location = selected_location.strip()
         if selected_location and selected_location not in user_input:
@@ -146,7 +311,7 @@ def combine_user_input_with_location(user_input: str, selected_location: str = N
 
 
 # =====================================================================
-# [STEP 1] Gemini 기반 지명 추론 및 법정동 세트 추출 함수
+# [STEP 1] Gemini 기반 지명 추론
 # =====================================================================
 def process_user_request(user_input: str) -> dict:
     prompt = f"""
@@ -165,7 +330,6 @@ def process_user_request(user_input: str) -> dict:
     - **'리' 단위 금지:** '리' 단위 지명(예: 화리현리, 가재리)은 반드시 상위 '읍/면' 또는 대표 '동' 명칭으로 변환하세요.
     - **상위 행정구역만 입력 시 (예: "시흥", "오산", "서울"):** 
       단일 지역 확정이 어려운 경우 해당 시/도의 주요 대표 거점 2~3곳을 `location_sets`에 배열로 반환하세요.
-      (예: "서울 공기 어때?" ➔ [["서울특별시", "종로구", "종로1가"], ["서울특별시", "강남구", "역삼동"], ["서울특별시", "영등포구", "여의도동"]])
     - **숫자형 행정동 통합:** "반포1동" ➔ "반포동".
 
     [응답 포맷] (다른 설명 없이 오직 이 JSON만 출력)
@@ -193,10 +357,10 @@ def process_user_request(user_input: str) -> dict:
 
 
 # =====================================================================
-# [STEP 2] 에어코리아 대기질 수집
+# [STEP 2] Fallback 데이터 정의
 # =====================================================================
 def get_fallback_data(station_name="기본측정소", sido="", sigungu="", umd=""):
-    print(f"⚠️ [{sido} {sigungu} {umd}] 공공데이터 수집 실패로 기본 Fallback 데이터 적용")
+    print(f"⚠️ [{sido} {sigungu} {umd}] API 및 크롤링 실패로 기본 Fallback 데이터 적용")
     return {
         "pm10": 45,
         "status_pm10": "보통",
@@ -204,6 +368,9 @@ def get_fallback_data(station_name="기본측정소", sido="", sigungu="", umd="
         "status_pm25": "보통",
         "o3": 0.035,
         "status_o3": "보통",
+        "so2": 0.003,
+        "co": 0.5,
+        "no2": 0.025,
         "yellow_dust": "안심 (영향 없음)",
         "temp": 22.0,
         "humi": 50,
@@ -237,33 +404,33 @@ def get_station_name_cached(sido: str, sigungu: str, umd_name: str, location_key
         }
         
         res_tm_raw = safe_requests_get(url_tm, params=params_tm)
+        if not res_tm_raw:
+            return None
 
         tmX, tmY = None, None
-        if res_tm_raw and res_tm_raw.status_code == 200:
-            try:
-                items_tm = res_tm_raw.json().get("response", {}).get("body", {}).get("items", [])
-                if isinstance(items_tm, list):
-                    for item in items_tm:
-                        item_sido = item.get("sidoName", "") or ""
-                        item_sgg = item.get("sggName", "") or ""
-                        
-                        sido_check = (sido[:2] in item_sido) if sido and item_sido else True
-                        sgg_check = (sigungu in item_sgg or item_sgg in sigungu) if sigungu and item_sgg else True
-
-                        if sido_check and sgg_check:
-                            tmX, tmY = item.get("tmX"), item.get("tmY")
-                            break
+        try:
+            items_tm = res_tm_raw.json().get("response", {}).get("body", {}).get("items", [])
+            if isinstance(items_tm, list):
+                for item in items_tm:
+                    item_sido = item.get("sidoName", "") or ""
+                    item_sgg = item.get("sggName", "") or ""
                     
-                    if not tmX and items_tm:
-                        tmX, tmY = items_tm[0].get("tmX"), items_tm[0].get("tmY")
-            except Exception as parse_e:
-                print(f"❌ [TM 좌표 JSON 파싱 에러]: {parse_e} | Response: {res_tm_raw.text[:200]}")
+                    sido_check = (sido[:2] in item_sido) if sido and item_sido else True
+                    sgg_check = (sigungu in item_sgg or item_sgg in sigungu) if sigungu and item_sgg else True
+
+                    if sido_check and sgg_check:
+                        tmX, tmY = item.get("tmX"), item.get("tmY")
+                        break
+                
+                if not tmX and items_tm:
+                    tmX, tmY = items_tm[0].get("tmX"), items_tm[0].get("tmY")
+        except Exception as parse_e:
+            print(f"❌ [TM 좌표 JSON 파싱 에러]: {parse_e}")
+            return None
 
         if not tmX or not tmY:
             print(f"❌ [{sido} {sigungu} {umd_name}] TM 좌표를 찾을 수 없습니다.")
             return None
-
-        time.sleep(0.3)
 
         # 2️⃣ 근접 측정소 조회 API
         url_nearby = "http://apis.data.go.kr/B552584/MsrstnInfoInqireSvc/getNearbyMsrstnList"
@@ -276,16 +443,18 @@ def get_station_name_cached(sido: str, sigungu: str, umd_name: str, location_key
         }
         
         res_nearby_raw = safe_requests_get(url_nearby, params=params_nearby)
+        if not res_nearby_raw:
+            return None
 
-        if res_nearby_raw and res_nearby_raw.status_code == 200:
-            try:
-                items_nearby = res_nearby_raw.json().get("response", {}).get("body", {}).get("items", [])
-                if isinstance(items_nearby, list) and items_nearby:
-                    station_name = items_nearby[0].get("stationName")
-                    print(f"✅ [{sido} {sigungu} {umd_name}] ➔ 측정소 매핑: {station_name}")
-                    return station_name
-            except Exception as parse_e:
-                print(f"❌ [근접측정소 JSON 파싱 에러]: {parse_e} | Response: {res_nearby_raw.text[:200]}")
+        try:
+            items_nearby = res_nearby_raw.json().get("response", {}).get("body", {}).get("items", [])
+            if isinstance(items_nearby, list) and items_nearby:
+                station_name = items_nearby[0].get("stationName")
+                print(f"✅ [{sido} {sigungu} {umd_name}] ➔ 측정소 매핑: {station_name}")
+                return station_name
+        except Exception as parse_e:
+            print(f"❌ [근접측정소 JSON 파싱 에러]: {parse_e}")
+            return None
 
     except Exception as e:
         print(f"❌ [get_station_name_cached 예외 발생]: {e}")
@@ -293,103 +462,114 @@ def get_station_name_cached(sido: str, sigungu: str, umd_name: str, location_key
     return None
 
 
+# =====================================================================
+# 🔄 [핵심 수집 함수] API 접속 실패 시 즉시 크롤링 ➔ 실패 시 Fallback
+# =====================================================================
 def fetch_air_quality_by_location(location_set: list, location_key: str, air_key: str, h2b_map: dict, valid_bjd_map: dict = None) -> dict:
     if not location_set or len(location_set) < 3:
         return get_fallback_data()
 
     sido, sigungu, raw_umd = location_set[0], location_set[1], location_set[2]
     umd_name = get_beobjong_from_map(sido, sigungu, raw_umd, h2b_map, valid_bjd_map)
-    raw_air_key = urllib.parse.unquote(air_key)
+    full_location = f"{sido} {sigungu} {umd_name}".strip()
+    raw_air_key = urllib.parse.unquote(air_key) if air_key else ""
 
-    try:
-        station_name = get_station_name_cached(sido, sigungu, umd_name, location_key)
-
-        if not station_name:
-            return get_fallback_data(sido=sido, sigungu=sigungu, umd=umd_name)
-
-        time.sleep(0.3)
-
-        base_air_url = st.secrets.get(
-            "AIR_PORTAL_URL",
-            "http://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty"
-        )
-        params_air = {
-            "serviceKey": raw_air_key,
-            "returnType": "json",
-            "stationName": station_name,
-            "dataTerm": "DAILY",
-            "ver": "1.3"
-        }
-        
-        res_air_raw = safe_requests_get(base_air_url, params=params_air)
-
-        if not res_air_raw or res_air_raw.status_code != 200:
-            status = res_air_raw.status_code if res_air_raw else 'No Response'
-            print(f"❌ [대기질 API 에러] HTTP Status: {status}")
-            return get_fallback_data(station_name, sido, sigungu, umd_name)
-
+    # -------------------------------------------------------------
+    # 1️⃣ [1순위] 에어코리아 API 호출 시도
+    # -------------------------------------------------------------
+    if location_key and air_key:
         try:
-            items_air = res_air_raw.json().get("response", {}).get("body", {}).get("items", [])
-            if not items_air or not isinstance(items_air, list):
-                print(f"❌ [{station_name}] 대기질 데이터 항목 없음 (API 결과 비어있음)")
-                return get_fallback_data(station_name, sido, sigungu, umd_name)
+            station_name = get_station_name_cached(sido, sigungu, umd_name, location_key)
 
-            target_station = items_air[0]
-            
-            pm10_val = target_station.get("pm10Value")
-            pm25_val = target_station.get("pm25Value")
-            o3_val = target_station.get("o3Value")
+            if station_name:
+                base_air_url = st.secrets.get(
+                    "AIR_PORTAL_URL",
+                    "http://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty"
+                )
+                params_air = {
+                    "serviceKey": raw_air_key,
+                    "returnType": "json",
+                    "stationName": station_name,
+                    "dataTerm": "DAILY",
+                    "ver": "1.3"
+                }
+                
+                res_air_raw = safe_requests_get(base_air_url, params=params_air)
 
-            pm10 = int(pm10_val) if pm10_val and pm10_val != "-" else 35
-            pm25 = int(pm25_val) if pm25_val and pm25_val != "-" else 18
-            o3 = float(o3_val) if o3_val and o3_val != "-" else 0.030
+                if res_air_raw:
+                    items_air = res_air_raw.json().get("response", {}).get("body", {}).get("items", [])
+                    if isinstance(items_air, list) and len(items_air) > 0:
+                        target_station = items_air[0]
+                        
+                        pm10_val = target_station.get("pm10Value")
+                        pm25_val = target_station.get("pm25Value")
+                        o3_val = target_station.get("o3Value")
+                        so2_val = target_station.get("so2Value")
+                        co_val = target_station.get("coValue")
+                        no2_val = target_station.get("no2Value")
 
-            if pm10 <= 30: status_pm10 = "좋음"
-            elif pm10 <= 80: status_pm10 = "보통"
-            elif pm10 <= 150: status_pm10 = "나쁨"
-            else: status_pm10 = "매우 나쁨"
+                        pm10 = int(pm10_val) if pm10_val and pm10_val != "-" else 35
+                        pm25 = int(pm25_val) if pm25_val and pm25_val != "-" else 18
+                        o3 = float(o3_val) if o3_val and o3_val != "-" else 0.030
+                        so2 = float(so2_val) if so2_val and so2_val != "-" else 0.003
+                        co = float(co_val) if co_val and co_val != "-" else 0.5
+                        no2 = float(no2_val) if no2_val and no2_val != "-" else 0.025
 
-            if pm25 <= 15: status_pm25 = "좋음"
-            elif pm25 <= 35: status_pm25 = "보통"
-            elif pm25 <= 75: status_pm25 = "나쁨"
-            else: status_pm25 = "매우 나쁨"
+                        status_pm10 = "좋음" if pm10 <= 30 else ("보통" if pm10 <= 80 else ("나쁨" if pm10 <= 150 else "매우 나쁨"))
+                        status_pm25 = "좋음" if pm25 <= 15 else ("보통" if pm25 <= 35 else ("나쁨" if pm25 <= 75 else "매우 나쁨"))
+                        status_o3 = "좋음" if o3 <= 0.030 else ("보통" if o3 <= 0.090 else ("나쁨" if o3 <= 0.150 else "매우 나쁨"))
 
-            if o3 <= 0.030: status_o3 = "좋음"
-            elif o3 <= 0.090: status_o3 = "보통"
-            elif o3 <= 0.150: status_o3 = "나쁨"
-            else: status_o3 = "매우 나쁨"
+                        yellow_dust_status = "안심 (영향 없음)"
+                        if pm10 > 300: yellow_dust_status = "🚨 황사 경보 수준 (매우 위험)"
+                        elif pm10 > 150: yellow_dust_status = "⚠️ 황사 주의 수준 (위험)"
+                        elif pm10 > 80 and (pm10 / (pm25 + 1)) > 2.5: yellow_dust_status = "🟡 가벼운 황사 영향/약한 황사"
 
-            yellow_dust_status = "안심 (영향 없음)"
-            if pm10 > 300:
-                yellow_dust_status = "🚨 황사 경보 수준 (매우 위험)"
-            elif pm10 > 150:
-                yellow_dust_status = "⚠️ 황사 주의 수준 (위험)"
-            elif pm10 > 80 and (pm10 / (pm25 + 1)) > 2.5:
-                yellow_dust_status = "🟡 가벼운 황사 영향/약한 황사"
+                        print(f"✅ [에어코리아 API 수집 성공] {full_location} ({station_name} 측정소)")
+                        return {
+                            "pm10": pm10, "status_pm10": status_pm10,
+                            "pm25": pm25, "status_pm25": status_pm25,
+                            "o3": o3, "status_o3": status_o3,
+                            "so2": so2, "co": co, "no2": no2,
+                            "yellow_dust": yellow_dust_status,
+                            "temp": 24.5, "humi": 65, "traffic": "보통",
+                            "station": station_name,
+                            "sido": sido, "sigungu": sigungu, "umd": umd_name
+                        }
+        except Exception as e:
+            print(f"⚠️ [API 수집 예외] {e} -> 크롤링으로 직행합니다.")
 
-            return {
-                "pm10": pm10,
-                "status_pm10": status_pm10,
-                "pm25": pm25,
-                "status_pm25": status_pm25,
-                "o3": o3,
-                "status_o3": status_o3,
-                "yellow_dust": yellow_dust_status,
-                "temp": 24.5,
-                "humi": 65,
-                "traffic": "보통",
-                "station": station_name,
-                "sido": sido,
-                "sigungu": sigungu,
-                "umd": umd_name
-            }
-        except Exception as parse_e:
-            print(f"❌ [대기질 JSON 파싱 예외]: {parse_e} | Response: {res_air_raw.text[:200]}")
-            return get_fallback_data(station_name, sido, sigungu, umd_name)
+    # -------------------------------------------------------------
+    # 2️⃣ [2순위] API 접속 실패 시 즉시 네이버 크롤링 수행
+    # -------------------------------------------------------------
+    print(f"🌐 [크롤링 전환] 네이버에서 '{full_location}' 날씨/대기질 정보 수집 중...")
+    crawled = get_naver_weather_with_numbers(full_location)
 
-    except Exception as e:
-        print(f"⚠️ [{umd_name}] 대기질 수집 예외 발생: {e}")
-        return get_fallback_data(sido=sido, sigungu=sigungu, umd=umd_name)
+    if crawled:
+        print(f"✅ [네이버 크롤링 성공] {full_location} -> PM10: {crawled['pm10']} ({crawled['status_pm10']})")
+        return {
+            "pm10": crawled["pm10"],
+            "status_pm10": crawled["status_pm10"],
+            "pm25": crawled["pm25"],
+            "status_pm25": crawled["status_pm25"],
+            "o3": 0.030,
+            "status_o3": crawled["status_o3"],
+            "so2": 0.003,
+            "co": 0.5,
+            "no2": 0.025,
+            "yellow_dust": "안심 (영향 없음)",
+            "temp": crawled["temperature"],
+            "uv_num": crawled["uv_num"],
+            "status_uv": crawled["status_uv"],
+            "station": f"{full_location}(네이버 크롤링)",
+            "sido": sido,
+            "sigungu": sigungu,
+            "umd": umd_name
+        }
+
+    # -------------------------------------------------------------
+    # 3️⃣ [3순위] 크롤링까지 실패 시 Fallback 데이터 반환
+    # -------------------------------------------------------------
+    return get_fallback_data("기본측정소", sido, sigungu, umd_name)
 
 
 # =====================================================================
@@ -409,17 +589,20 @@ def fetch_all_air_candidates(location_sets: list, location_key: str, air_key: st
             valid_bjd_map=valid_bjd_map
         )
         results.append(res)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     return results
 
 
 # =====================================================================
-# [STEP 4] 대기질 + 황사 + 오존 데이터 기반 Gemini 최종 답변 생성
+# [STEP 4] Gemini 답변 생성
 # =====================================================================
 def generate_final_response(user_input: str, air_results: list, user_profile: dict = None) -> str:
-    
-    # 1. 프로필 정보 및 스타일별 엄격한 프롬프트 지침 구성
+    for air in air_results:
+        ml_res = predict_pm10_with_explanation(air)
+        if ml_res:
+            air["ml_model_prediction"] = ml_res
+
     profile_guide = ""
     style_instruction = ""
     
@@ -435,7 +618,6 @@ def generate_final_response(user_input: str, air_results: list, user_profile: di
     - 선호 답변 스타일: {ai_style}
     """
 
-        # ✨ [개선된 템플릿 방식] 완전히 격식과 구조가 구분되도록 서식 지정
         if ai_style == "친절하고 세심한 설명":
             style_instruction = """
     [답변 출력 스타일: 친절하고 세심한 설명]
@@ -446,6 +628,9 @@ def generate_final_response(user_input: str, air_results: list, user_profile: di
 
     🌿 **오늘의 공기 상태**
     (어려운 전문 수치 대신 '좋음', '보통' 등 등급 중심으로 쉽게 풀어서 설명하는 2~3문장)
+
+    🤖 **AI 머신러닝(LightGBM) 예측**
+    - (ml_model_prediction 데이터가 있는 경우, 주요 가스 오염원 기여도 및 모델이 예상한 PM10 수치를 쉽게 풀어서 1~2문장 안내)
 
     💡 **세심한 산책/외출 팁**
     - (마스크 착용 여부, 추천 외출 시간대 등 따뜻하고 세심한 권장사항 2~3개)
@@ -459,10 +644,14 @@ def generate_final_response(user_input: str, air_results: list, user_profile: di
     [작성 양식]
     📊 **[대기질 측정 데이터 분석 보고서]**
     • 측정소: {측정소명}
-    • 미세먼지(PM10): {수치}㎍/㎥ ({상태})
+    • 실시간 미세먼지(PM10): {수치}㎍/㎥ ({상태})
     • 초미세먼지(PM2.5): {수치}㎍/㎥ ({상태})
     • 오존(O3): {수치}ppm ({상태})
     • 황사 영향: {황사상태}
+
+    🤖 **[LightGBM AI 머신러닝 예측 결과]**
+    • 예상 PM10 농도: {ml_predicted_pm10} ㎍/㎥
+    • 주요 가스 오염원 기여 요인: {top_contributing_factors}
 
     🔍 **[데이터 종합 평가]**
     (수치 기반 대기 상태 및 오염 물질 축적/정체 요인 2문장 이내 분석)
@@ -471,67 +660,57 @@ def generate_final_response(user_input: str, air_results: list, user_profile: di
     1. 야외활동: (수치에 근거한 활동 가능 여부 판정)
     2. 환기 여부: (수치에 근거한 환기 적합성 판정)
     """
-        else:  # 핵심만 3줄 요약 또는 기타 기본값
+        else:
             style_instruction = """
     [답변 출력 스타일: 핵심만 3줄 요약]
     오직 아래 3줄 형태로만 출력하세요. 다른 서론/결론은 일절 작성하지 마세요.
 
-    • **공기 상태:** (측정소 및 수치/상태 요약)
+    • **공기 상태:** (측정소 및 수치/상태 요약 + ML 예측 PM10 수치 간단 병기)
     • **활동 판정:** (산책/환기 가능 여부)
-    • **주의 사항:** (핵심 주의사항 1가지)
+    • **주의 사항:** (주요 가스 오염원 기여도 또는 핵심 주의사항 1가지)
     """
 
-    # 2. Gemini 프롬프트 구성
     prompt = f"""
     당신은 친절하고 전문적인 대기질 및 호흡기/면역 건강 안내 AI 비서입니다.
-    사용자 질문과 공공데이터 API로부터 수집된 실시간 대기질 데이터(미세먼지, 초미세먼지, 오존, 황사 영향 등)를 바탕으로 자연스럽고 명확하게 답변해 주세요.
-    사용자가 입력한 환경정보에 따라 답변해 주세요. (예: 오산 미세먼지 -> 미세먼지 농도를 중점으로 안내, 시흥 오존농도 -> 오존 중점으로 안내)
-    지역명만 써져 있는 경우에는 환경 정보를 묻는 의도로 생각해 주세요.
+    사용자 질문과 수집 데이터, 그리고 LightGBM 머신러닝 예측 결과를 종합하여 답변해 주세요.
 
     [사용자 질문]
     "{user_input}"
     {profile_guide}
 
-    [수집된 실시간 대기질 데이터 목록]
+    [수집된 실시간 대기질 및 LightGBM 예측 데이터]
     {json.dumps(air_results, ensure_ascii=False, indent=2)}
 
     {style_instruction}
 
     [공통 필수 규칙]
     0. **다중지역:** 두 곳 이상 여러 곳에서 환경정보 값을 받았다면, 두 곳의 환경정보를 모두 표시해 주세요.
-    1. **주요 대기질 항목 포함:** 요청된 지역의 미세먼지(PM10), 초미세먼지(PM2.5), 오존(O3) 수치 및 등급과 황사 영향도(`yellow_dust`)를 언급해 주세요.
-    2. **오존(O3) 특화 안내:** 오존 수치가 '나쁨'(0.091ppm 이상) 이상일 경우, 가스형 독성 물질로 마스크로 차단되지 않음을 알리고 실외 활동 자제를 강조해 주세요.
-    3. **측정소 정보 명시:** 어떤 측정소 데이터인지 밝혀 주세요.
-    4. **질문 의도 확인:** 질문 내용이 대기질/환경정보 관련 질문이 아니라면 "잘못 입력하셨거나 환경질문이 아닙니다"라는 취지의 문장을 출력해 주세요.
+    1. **주요 대기질 항목 포함:** 요청된 지역의 미세먼지(PM10), 초미세먼지(PM2.5), 오존(O3) 수치 및 등급과 황사 영향도를 언급해 주세요.
+    2. **LightGBM ML 예측 언급:** 데이터 내 `ml_model_prediction` 항목이 존재하는 경우, AI 머신러닝 예측 결과(예상 PM10 농도 및 주요 가스 기여도)를 답변에 반드시 포함해 주세요.
+    3. **오존(O3) 특화 안내:** 오존 수치가 '나쁨'(0.091ppm 이상) 이상일 경우, 실외 활동 자제를 강조해 주세요.
+    4. **측정소 정보 명시:** 어떤 측정소 데이터인지 밝혀 주세요.
+    5. **질문 의도 확인:** 질문 내용이 대기질/환경정보 관련 질문이 아니라면 "잘못 입력하셨거나 환경질문이 아닙니다"라는 취지의 문장을 출력해 주세요.
     """.strip()
 
     try:
         result = call_gemini_api(prompt=prompt, output_type="text")
-
-        if isinstance(result, str):
-            return result
-        elif isinstance(result, dict) and "text" in result:
-            return result["text"]
-        else:
-            print(f"❌ [2차 Gemini API 응답 에러]: {result}")
+        if isinstance(result, str): return result
+        elif isinstance(result, dict) and "text" in result: return result["text"]
     except Exception as e:
         print(f"❌ [2차 Gemini API 예외 발생]: {e}")
 
-    return "죄송합니다. 대기질 정보를 바탕으로 답변을 생성하는 중 오류가 발생했습니다."
+    return "죄송합니다. 대기질 정보 및 ML 예측 결과를 바탕으로 답변을 생성하는 중 오류가 발생했습니다."
 
 
 # =====================================================================
-# 🧪 파이프라인 대화형 실행 테스트
+# 🧪 대화형 실행 테스트
 # =====================================================================
 if __name__ == "__main__":
     LOCATION_KEY = st.secrets.get("AIR_PORTAL_LOCATION_KEY", "")
     AIR_KEY = st.secrets.get("AIR_PORTAL_KEY", "")
 
-    # API 키 존재 여부 검증 및 CMD 출력
     if not LOCATION_KEY or not AIR_KEY:
-        print("🚨 [설정 에러] .streamlit/secrets.toml 에 API 키가 설정되지 않았습니다!")
-        print(f" - LOCATION_KEY: {'설정됨' if LOCATION_KEY else '❌ 누락'}")
-        print(f" - AIR_KEY: {'설정됨' if AIR_KEY else '❌ 누락'}")
+        print("ℹ️ API 키 미설정/누락 -> [네이버 크롤링 모드]를 기본 우선으로 연동합니다.")
 
     locations_df, h2b_map, valid_bjd_map = locations_upload()
 
@@ -542,12 +721,11 @@ if __name__ == "__main__":
     test_cnt = 1
     key = True
 
-    # 테스트용 즐겨찾기/프로필 설정 예시
-    selected_location = "시흥시 정왕동"  # UI/즐겨찾기에서 넘어오는 위치값 예시
+    selected_location = "시흥시 정왕동"
     user_profile = {
         'user_type': '일반 성인',
         'activity': '산책',
-        'ai_style': '친절하고 세심한 설명'  # 또는 "전문 수치/데이터 중심 분석"
+        'ai_style': '친절하고 세심한 설명'
     }
 
     while key:
@@ -563,11 +741,9 @@ if __name__ == "__main__":
                 print("⚠️ 질문을 입력해 주세요.")
                 continue
 
-            # ✨ [핵심 적용] 즐겨찾기 선택 지역명 전처리 및 결합
             user_input = combine_user_input_with_location(raw_input_text, selected_location)
             print(f"📌 [최종 프롬프트 전달 문장]: {user_input}")
 
-            # 1차 Gemini 호출
             gemini_res = process_user_request(user_input)
             is_query = gemini_res.get("is_location_query", False)
             location_sets = gemini_res.get("location_sets", [])
@@ -579,9 +755,9 @@ if __name__ == "__main__":
                 test_cnt += 1
                 continue
 
-            time.sleep(1.5)
+            time.sleep(0.5)
 
-            # 공공데이터 수집
+            # API -> 크롤링 -> Fallback 3단계 자동 수집
             air_results = fetch_all_air_candidates(
                 location_sets=location_sets,
                 location_key=LOCATION_KEY,
@@ -589,18 +765,17 @@ if __name__ == "__main__":
                 h2b_map=h2b_map,
                 valid_bjd_map=valid_bjd_map
             )
-            print(f"  2️⃣ [공공데이터 수집] 결과 데이터 {len(air_results)}건 준비 완료")
+            print(f"  2️⃣ [데이터 수집] 결과 데이터 {len(air_results)}건 준비 완료")
 
-            # 2차 Gemini 호출
             final_answer = generate_final_response(user_input, air_results, user_profile)
 
-            print("\n  3️⃣ [2차 Gemini] 최종 답변:")
+            print("\n  3️⃣ [2차 Gemini + LightGBM] 최종 답변:")
             print("  " + "-" * 60)
             print(f"{final_answer}")
             print("  " + "-" * 60)
 
             test_cnt += 1
-            time.sleep(1.5)
+            time.sleep(0.5)
 
         except KeyboardInterrupt:
             print("\n\n👋 사용자 중단(Ctrl+C)으로 종료합니다.")
