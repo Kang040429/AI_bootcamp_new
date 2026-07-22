@@ -53,7 +53,21 @@ if lgb_model is not None:
         print(f"⚠️ [LightGBM] 특성 중요도 계산 중 예외 발생: {e}")
 
 
-def predict_pm10_with_explanation(air_data: dict) -> dict:
+def predict_pm10_with_explanation(input_data):
+    model = load_lgbm_model()
+    if model is None:
+        print("⚠️ [LightGBM] 모델이 None이므로 예측을 건너뜁니다.")
+        return None
+        
+    try:
+        # ML 예측 실행
+        prediction = model.predict(input_data)
+        print(f"✅ [LightGBM] 예측 완료: {prediction}")
+        return prediction
+    except Exception as e:
+        # 💡 예측 수행 중 에러가 나는지 확인하기 위해 출력
+        print(f"❌ [LightGBM] predict() 실행 중 에러 발생: {type(e).__name__} - {e}")
+        return None
     """
     대기질 수집 결과(SO2, CO, O3, NO2 등)를 LightGBM 모델 입력 형식으로 변환하여 PM10을 예측합니다.
     """
