@@ -1,0 +1,7 @@
+[client]
+# 툴바(Rerun, Stop 등) 모드를 최소화하여 일반 사용자에게 보이지 않게 감춥니다.
+#toolbarMode = "minimal"
+toolbarMode = "developer"
+[ui]
+# 우측 상단의 Running 로딩 애니메이션, Stop 정지 버튼 및 찌꺼기 상단 바 공간을 완전히 비활성화합니다.
+hideTopBar = true
