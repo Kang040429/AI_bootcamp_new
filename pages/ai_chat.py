@@ -1,110 +1,186 @@
-# pages/ai_chat.py
 import streamlit as st
-import main_agent as env_api
+import main_agent as agent  # main_agent.py 모듈 임포트
 
+# 1. 페이지 설정
 st.set_page_config(
-    page_title="숨쉬는 일상 - AI 에이전트 상담소",
-    page_icon="💬",
-    layout="wide"
+    page_title="공기질 AI - AIR AI", 
+    page_icon="💬", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-# CSS 스타일 적용
-try:
-    with open("style.css", "r", encoding="utf-8") as f:
-        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
-except FileNotFoundError:
-    pass
+# -------------------------------------------------------------------
+# CSS 스타일링 (모바일 프레임 + 하단바 규격 통일)
+# -------------------------------------------------------------------
+st.markdown("""
+    <style>
+    .block-container {
+        padding-top: 1rem !important;
+        padding-bottom: 120px !important;
+    }
+    
+    header[data-testid="stHeader"] { height: 0px !important; background: transparent !important; }
+    [data-testid="collapsedControl"] { display: none !important; }
+    section[data-testid="stSidebar"] { display: none !important; }
 
-# 마스터 데이터 및 Secrets 키 로드
-locations_df, h2b_map, valid_bjd_map = env_api.locations_upload()
-LOCATION_KEY = st.secrets.get("AIR_PORTAL_LOCATION_KEY", "")
-AIR_KEY = st.secrets.get("AIR_PORTAL_KEY", "")
+    footer { display: none !important; }
+    div[data-testid="stBottom"] {
+        padding: 0 !important;
+        bottom: 0 !important;
+        background-color: #0e1117 !important;
+    }
+    
+    div[data-testid="stBottom"] > div {
+        padding: 0px !important;
+        gap: 0px !important;
+    }
 
-# 🏠 상단 이동 버튼
-if st.button("🏠 메인 대시보드로 돌아가기"):
-    st.switch_page("app.py")
+    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] {
+        border-top: 1px solid #262730 !important;
+        padding: 8px 16px 12px 16px !important;
+        background-color: #0e1117 !important;
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        gap: 6px !important;
+        width: 100% !important;
+        margin: 0 !important;
+    }
+    
+    div[data-testid="stBottom"] [data-testid="stHorizontalBlock"] > div {
+        flex: 1 1 0 !important;
+        width: 0 !important;
+        min-width: 0 !important;
+    }
 
-st.markdown("---")
+    div[data-testid="stBottom"] button,
+    div[data-testid="stBottom"] button[kind="primary"],
+    div[data-testid="stBottom"] button[kind="secondary"] {
+        width: 100% !important;
+        height: 42px !important;
+        min-height: 42px !important;
+        max-height: 42px !important;
+        margin: 0 !important;
+        padding: 0px !important;
+        font-size: 13px !important;
+        font-weight: bold !important;
+        white-space: nowrap !important;
+        box-sizing: border-box !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# 사용자 정보 세션 처리
-user_name = st.session_state.get("user_name", "성주")
-user_disease = st.session_state.get("user_disease", "비염")
+# -------------------------------------------------------------------
+# 🔗 user.py 세션 프로필 로드
+# -------------------------------------------------------------------
+if "user_profile" not in st.session_state:
+    st.session_state.user_profile = {
+        "location": "경기도 시흥시",
+        "user_type": "일반 성인",
+        "activity": "환기 / 산책",
+        "ai_style": "핵심만 3줄 요약",
+        "notify_alarm": True
+    }
 
-if "current_region" not in st.session_state:
-    st.session_state["current_region"] = ["서울특별시", "강남구", "역삼동"]
-if "current_region_str" not in st.session_state:
-    st.session_state["current_region_str"] = "서울특별시 강남구 역삼동"
+profile = st.session_state.user_profile
 
-# ---------------------------------------------------------------------
-# 사이드바
-# ---------------------------------------------------------------------
-with st.sidebar:
-    st.header("👤 사용자 정보")
-    st.write(f"**이름**: {user_name}")
-    st.write(f"**관심 질환**: {user_disease}")
-    st.write(f"**현재 설정 위치**: {st.session_state['current_region_str']}")
-    st.markdown("---")
-    if st.button("🏠 대시보드로 이동", key="sidebar_home_btn", use_container_width=True):
-        st.switch_page("app.py")
-
-# ---------------------------------------------------------------------
-# 헤더
-# ---------------------------------------------------------------------
-st.title("💬 AI 대기질 맞춤 상담소")
-st.caption(f"반갑습니다, **{user_name}**님! ({user_disease} 맞춤 대기케어 가이드 서비스)")
-
-# ---------------------------------------------------------------------
-# 대화창 및 main_agent 함수 직접 연결
-# ---------------------------------------------------------------------
+# 대화 기록 초기화
 if "messages" not in st.session_state:
-    st.session_state["messages"] = [
-        {
-            "role": "assistant", 
-            "content": f"안녕하세요 {user_name}님! 궁금하신 지역이나 대기질 상태를 편하게 물어보세요."
-        }
-    ]
+    st.session_state.messages = []
 
-# 이전 대화 출력
-for msg in st.session_state["messages"]:
-    st.chat_message(msg["role"]).write(msg["content"])
+# -------------------------------------------------------------------
+# 화면 상단 헤더
+# -------------------------------------------------------------------
+st.markdown("<h3 style='margin-top:0px; margin-bottom:2px;'>💬 공기질 맞춤 AI 상담소</h3>", unsafe_allow_html=True)
+st.caption(f"📍 **{profile['location']}** | 👤 **{profile['user_type']}** | 🏃 **{profile['activity']}** 기준 맞춤 상담")
 
-# 사용자 입력
-if prompt := st.chat_input("궁금한 지역이나 질문을 입력하세요"):
-    st.session_state["messages"].append({"role": "user", "content": prompt})
-    st.chat_message("user").write(prompt)
+st.divider()
 
-    # 🖥️ [CMD 로그] 질문 수신
-    print("\n" + "=" * 80)
-    print(f"💬 [사용자 질문 수신]: {prompt}")
-    print("=" * 80)
+# 기존 대화 출력
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    with st.spinner("🤖 main_agent 파이프라인 가동 중..."):
-        # 1. main_agent: Gemini 지명 및 질문 의도 추론
-        gemini_res = env_api.process_user_request(prompt)
-        is_query = gemini_res.get("is_location_query", False)
-        location_sets = gemini_res.get("location_sets", [])
+# 채팅 입력 및 처리
+if prompt := st.chat_input(f"예: 오늘 {profile['location']}에서 {profile['activity']} 해도 될까요?"):
+    # 1. 사용자 메시지 표시 및 저장
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        print(f" 1️⃣ [1차 Gemini 추론] 환경질문: {is_query} | 추출 지명: {location_sets}")
+    # 2. main_agent 파이프라인을 통한 대기질 수집 및 AI 답변 생성
+    with st.chat_message("assistant"):
+        with st.spinner("📡 실시간 공기질 측정 데이터 확인 중..."):
+            try:
+                # secrets에서 API 키 로드
+                loc_key = st.secrets.get("AIR_PORTAL_LOCATION_KEY", "")
+                air_key = st.secrets.get("AIR_PORTAL_KEY", "")
 
-        if is_query and location_sets:
-            # 2. main_agent: API 데이터 조회 (단일/다중 일괄)
-            air_results = env_api.fetch_all_air_candidates(
-                location_sets=location_sets,
-                location_key=LOCATION_KEY,
-                air_key=AIR_KEY,
-                h2b_map=h2b_map,
-                valid_bjd_map=valid_bjd_map
-            )
-            print(f" 2️⃣ [API 데이터 수집] 총 {len(air_results)}건 완료")
+                # 법정동 마스터 매핑 데이터 로드
+                _, h2b_map, valid_bjd_map = agent.locations_upload()
 
-            # 3. main_agent: Gemini 최종 답변 생성
-            response = env_api.generate_final_response(prompt, air_results)
-            print(" 3️⃣ [2차 Gemini] 최종 응답 생성 완료\n" + "-" * 50 + f"\n{response}\n" + "-" * 50)
-            
-        else:
-            response = "질문에서 유효한 지역을 찾지 못했거나 환경 관련 질문이 아닙니다. 지역명(예: '시흥', '오산')을 포함하여 다시 질문해주세요!"
-            print(" ⚠️ [예외] 유효한 지명 미감지")
+                # [STEP 1] 1차 Gemini 추론 (지역 및 의도 파악)
+                gemini_res = agent.process_user_request(prompt)
+                is_query = gemini_res.get("is_location_query", False)
+                location_sets = gemini_res.get("location_sets", [])
 
-    # 화면에 결과 출력 및 저장
-    st.session_state["messages"].append({"role": "assistant", "content": response})
-    st.rerun()
+                # 질문에 지역 정보가 모호한 경우 프로필 기본 위치 추가 후 재시도
+                if not location_sets and profile.get("location"):
+                    fallback_prompt = f"{prompt} ({profile['location']})"
+                    gemini_res = agent.process_user_request(fallback_prompt)
+                    is_query = gemini_res.get("is_location_query", False)
+                    location_sets = gemini_res.get("location_sets", [])
+
+                if not is_query or not location_sets:
+                    response_text = "대기질, 미세먼지, 오존 등 공기 상태나 환기/외출 관련 질문을 입력해 주세요! (예: 오늘 시흥시 미세먼지 어때?)"
+                else:
+                    # [STEP 2] 실시간 공공데이터 수집
+                    air_results = agent.fetch_all_air_candidates(
+                        location_sets=location_sets,
+                        location_key=loc_key,
+                        air_key=air_key,
+                        h2b_map=h2b_map,
+                        valid_bjd_map=valid_bjd_map
+                    )
+
+                    # 사용자 프로필 정보를 가이드 프롬프트로 구성
+                    user_context_prompt = f"""
+                    [사용자 프로필 컨텍스트]
+                    - 사용자 질문: "{prompt}"
+                    - 대상/상태: {profile.get('user_type', '일반 성인')}
+                    - 관심 야외활동: {profile.get('activity', '환기 / 산책')}
+                    - 선호 스타일: {profile.get('ai_style', '핵심만 3줄 요약')}
+                    """
+
+                    # [STEP 3] 2차 Gemini 최종 답변 생성
+                    response_text = agent.generate_final_response(
+                        user_input=user_context_prompt,
+                        air_results=air_results
+                    )
+
+                st.markdown(response_text)
+
+            except Exception as e:
+                response_text = f"⚠️ 데이터 분석 중 오류가 발생했습니다: {str(e)}"
+                st.error(response_text)
+
+    # 3. AI 메시지 저장
+    st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+# -------------------------------------------------------------------
+# 화면 최하단 완전 고정 구역 (st.bottom)
+# -------------------------------------------------------------------
+with st.bottom:
+    b_col1, b_col2, b_col3 = st.columns(3)
+
+    with b_col1:
+        if st.button("공기질 AI", type="primary", use_container_width=True):
+            st.rerun()
+
+    with b_col2:
+        if st.button("홈", use_container_width=True):
+            st.switch_page("app.py")
+
+    with b_col3:
+        if st.button("사용자 설정", use_container_width=True):
+            st.switch_page("pages/user.py")
