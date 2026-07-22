@@ -31,7 +31,7 @@ def safe_requests_get(url: str, params: dict, max_retries: int = 3) -> requests.
                 print(f"⚠️ [API 429 제한 발생] {delay}초 대기 후 재시도합니다... ({attempt + 1}/{max_retries})")
                 time.sleep(delay)
                 delay *= 2  # 대기 시간 2배 증가
-                continue
+                break
                 
             return res
         except Exception as e:
@@ -131,6 +131,21 @@ def get_beobjong_from_map(sido: str, sigungu: str, umd_name: str, h2b_map: dict,
 
 
 # =====================================================================
+# ✨ [NEW] 즐겨찾기 선택 지역명 자동 결합 함수
+# =====================================================================
+def combine_user_input_with_location(user_input: str, selected_location: str = None) -> str:
+    """
+    선택된 즐겨찾기 지역명이 존재하는 경우, 사용자 질문 앞에 결합하여 Gemini가 인식할 수 있게 변환합니다.
+    """
+    if selected_location:
+        selected_location = selected_location.strip()
+        if selected_location and selected_location not in user_input:
+            return f"[{selected_location}] {user_input}"
+            
+    return user_input
+
+
+# =====================================================================
 # [STEP 1] Gemini 기반 지명 추론 및 법정동 세트 추출 함수
 # =====================================================================
 def process_user_request(user_input: str) -> dict:
@@ -144,7 +159,7 @@ def process_user_request(user_input: str) -> dict:
     [수행 규칙]
     1. 사용자의 질문이 날씨, 대기질, 미세먼지, 오존, 황사, 공기 상태, 야외활동 가능 여부 등 [환경 정보] 관련 질문인지 판단하세요 (is_location_query: true/false).
     2. 질문에서 언급되거나 유추되는 지명을 **[시도명, 시군구명, 법정동명] 형태의 3개 원소를 가진 배열 세트**로 구성하여 location_sets에 담으세요.
-    3. 지역명만 써져 있는 경우에는 환경 정보를 묻든 질문으로 취급해주세요.
+    3. 지역명만 써져 있는 경우에는 환경 정보를 묻는 질문으로 취급해 주세요.
 
     [행정구역 정제 엄격 규칙]
     - **'리' 단위 금지:** '리' 단위 지명(예: 화리현리, 가재리)은 반드시 상위 '읍/면' 또는 대표 '동' 명칭으로 변환하세요.
@@ -402,39 +417,92 @@ def fetch_all_air_candidates(location_sets: list, location_key: str, air_key: st
 # =====================================================================
 # [STEP 4] 대기질 + 황사 + 오존 데이터 기반 Gemini 최종 답변 생성
 # =====================================================================
-def generate_final_response(user_input: str, air_results: list) -> str:
+def generate_final_response(user_input: str, air_results: list, user_profile: dict = None) -> str:
+    
+    # 1. 프로필 정보 및 스타일별 엄격한 프롬프트 지침 구성
+    profile_guide = ""
+    style_instruction = ""
+    
+    if user_profile:
+        user_type = user_profile.get('user_type', '일반 성인')
+        activity = user_profile.get('activity', '환기 / 산책')
+        ai_style = user_profile.get('ai_style', '핵심만 3줄 요약')
+
+        profile_guide = f"""
+    [사용자 맞춤 프로필 정보]
+    - 사용자 상태/대상: {user_type} (영유아/노약자/호흡기 질환자인 경우 안전 가이드를 보수적으로 제공)
+    - 관심 야외활동/목적: {activity}
+    - 선호 답변 스타일: {ai_style}
+    """
+
+        # ✨ [개선된 템플릿 방식] 완전히 격식과 구조가 구분되도록 서식 지정
+        if ai_style == "친절하고 세심한 설명":
+            style_instruction = """
+    [답변 출력 스타일: 친절하고 세심한 설명]
+    반드시 아래의 구조 템플릿을 그대로 활용하여 따뜻하게 작성해 주세요.
+
+    [작성 양식]
+    안녕하세요! 😊 (상황에 맞는 친근한 인사말)
+
+    🌿 **오늘의 공기 상태**
+    (어려운 전문 수치 대신 '좋음', '보통' 등 등급 중심으로 쉽게 풀어서 설명하는 2~3문장)
+
+    💡 **세심한 산책/외출 팁**
+    - (마스크 착용 여부, 추천 외출 시간대 등 따뜻하고 세심한 권장사항 2~3개)
+    - 기분 좋은 산책 되세요! (따뜻한 마무리 인사)
+    """
+        elif ai_style == "전문 수치/데이터 중심 분석":
+            style_instruction = """
+    [답변 출력 스타일: 전문 수치/데이터 중심 분석]
+    감정적인 인사말이나 사족을 제거하고, 오직 아래의 전문 보고서 서식으로만 작성해 주세요.
+
+    [작성 양식]
+    📊 **[대기질 측정 데이터 분석 보고서]**
+    • 측정소: {측정소명}
+    • 미세먼지(PM10): {수치}㎍/㎥ ({상태})
+    • 초미세먼지(PM2.5): {수치}㎍/㎥ ({상태})
+    • 오존(O3): {수치}ppm ({상태})
+    • 황사 영향: {황사상태}
+
+    🔍 **[데이터 종합 평가]**
+    (수치 기반 대기 상태 및 오염 물질 축적/정체 요인 2문장 이내 분석)
+
+    📋 **[행동 권고 기준]**
+    1. 야외활동: (수치에 근거한 활동 가능 여부 판정)
+    2. 환기 여부: (수치에 근거한 환기 적합성 판정)
+    """
+        else:  # 핵심만 3줄 요약 또는 기타 기본값
+            style_instruction = """
+    [답변 출력 스타일: 핵심만 3줄 요약]
+    오직 아래 3줄 형태로만 출력하세요. 다른 서론/결론은 일절 작성하지 마세요.
+
+    • **공기 상태:** (측정소 및 수치/상태 요약)
+    • **활동 판정:** (산책/환기 가능 여부)
+    • **주의 사항:** (핵심 주의사항 1가지)
+    """
+
+    # 2. Gemini 프롬프트 구성
     prompt = f"""
     당신은 친절하고 전문적인 대기질 및 호흡기/면역 건강 안내 AI 비서입니다.
     사용자 질문과 공공데이터 API로부터 수집된 실시간 대기질 데이터(미세먼지, 초미세먼지, 오존, 황사 영향 등)를 바탕으로 자연스럽고 명확하게 답변해 주세요.
-    사용자가 입력한 환경정보에 따라 답변해주세요. (예: 오산 미세먼지 -> 미세먼지 농도를 중점으로 알려준다, 시흥 오존농도 : 오존 중점으로 알려준다)
-    지역명만 써져 있는 경우에는 환경 정보를 묻는 의도로 생각해주세요.
+    사용자가 입력한 환경정보에 따라 답변해 주세요. (예: 오산 미세먼지 -> 미세먼지 농도를 중점으로 안내, 시흥 오존농도 -> 오존 중점으로 안내)
+    지역명만 써져 있는 경우에는 환경 정보를 묻는 의도로 생각해 주세요.
 
     [사용자 질문]
     "{user_input}"
+    {profile_guide}
 
     [수집된 실시간 대기질 데이터 목록]
     {json.dumps(air_results, ensure_ascii=False, indent=2)}
 
-    [답변 작성 가이드]
-    0. **다중지역**
-       -두 곳 이상 여러 곳에서 환경정보 값을 {air_results}로 받았다면, 두 곳의 환경정보를 모두 표시해주세요. 
-    1. **주요 대기질 항목 포함 (미세먼지, 초미세먼지, 오존, 황사):**
-       - 요청된 지역의 **미세먼지(PM10)**, **초미세먼지(PM2.5)**, **오존(O3)** 수치 및 등급을 명확히 안내하세요.
-       - **황사 영향도(`yellow_dust`)** 수치나 경고가 있을 경우 함께 언급하세요.
-    2. **오존(O3) 특화 안내 (중요):**
-       - 오존 수치가 '나쁨'(0.091ppm 이상) 이상일 경우: "오존은 가스형 독성 오염물질이라 KF94 마스크로도 걸러지지 않으므로, 햇빛이 강한 시간대 야외 활동 자체를 줄이는 것이 유일한 예방법"임을 알리고 천식 및 알레르기 환자의 실외 활동 자제를 강력 권고하세요.
-    3. **측정소 정보 명시:**
-       - 어떤 측정소에서 가져온 데이터인지 명시해 주세요.
-    4. **맞춤형 행동 요령:**
-       - 미세먼지/황사에 따른 마스크 착용 가이드 및 실내 환기 팁을 첨언하세요.
-    5. **어조:** 
-       - 친절하고 다정한 어조(~해요, ~입니다)를 사용하고 가독성 좋게 정돈된 문단이나 불렛포인트로 작성하세요.
+    {style_instruction}
 
-    6. **분량:**
-       - 5줄 이내로 작성하세요.
-
-    7. **의도:**
-       - 질문 내용이 환경정보를 물어보는 것 외의 내용으로 판단된다면, "잘못입력하셨습니다"라는 느낌의 문장 출력
+    [공통 필수 규칙]
+    0. **다중지역:** 두 곳 이상 여러 곳에서 환경정보 값을 받았다면, 두 곳의 환경정보를 모두 표시해 주세요.
+    1. **주요 대기질 항목 포함:** 요청된 지역의 미세먼지(PM10), 초미세먼지(PM2.5), 오존(O3) 수치 및 등급과 황사 영향도(`yellow_dust`)를 언급해 주세요.
+    2. **오존(O3) 특화 안내:** 오존 수치가 '나쁨'(0.091ppm 이상) 이상일 경우, 가스형 독성 물질로 마스크로 차단되지 않음을 알리고 실외 활동 자제를 강조해 주세요.
+    3. **측정소 정보 명시:** 어떤 측정소 데이터인지 밝혀 주세요.
+    4. **질문 의도 확인:** 질문 내용이 대기질/환경정보 관련 질문이 아니라면 "잘못 입력하셨거나 환경질문이 아닙니다"라는 취지의 문장을 출력해 주세요.
     """.strip()
 
     try:
@@ -474,18 +542,30 @@ if __name__ == "__main__":
     test_cnt = 1
     key = True
 
+    # 테스트용 즐겨찾기/프로필 설정 예시
+    selected_location = "시흥시 정왕동"  # UI/즐겨찾기에서 넘어오는 위치값 예시
+    user_profile = {
+        'user_type': '일반 성인',
+        'activity': '산책',
+        'ai_style': '친절하고 세심한 설명'  # 또는 "전문 수치/데이터 중심 분석"
+    }
+
     while key:
         try:
-            user_input = input(f"\n[{test_cnt:02d}] 💬 질문 입력 >> ").strip()
+            raw_input_text = input(f"\n[{test_cnt:02d}] 💬 질문 입력 >> ").strip()
 
-            if user_input.lower() in ["exit", "q", "quit", "종료"]:
+            if raw_input_text.lower() in ["exit", "q", "quit", "종료"]:
                 print("\n👋 테스트를 종료합니다.")
                 key = False
                 break
 
-            if not user_input:
+            if not raw_input_text:
                 print("⚠️ 질문을 입력해 주세요.")
                 continue
+
+            # ✨ [핵심 적용] 즐겨찾기 선택 지역명 전처리 및 결합
+            user_input = combine_user_input_with_location(raw_input_text, selected_location)
+            print(f"📌 [최종 프롬프트 전달 문장]: {user_input}")
 
             # 1차 Gemini 호출
             gemini_res = process_user_request(user_input)
@@ -512,7 +592,7 @@ if __name__ == "__main__":
             print(f"  2️⃣ [공공데이터 수집] 결과 데이터 {len(air_results)}건 준비 완료")
 
             # 2차 Gemini 호출
-            final_answer = generate_final_response(user_input, air_results)
+            final_answer = generate_final_response(user_input, air_results, user_profile)
 
             print("\n  3️⃣ [2차 Gemini] 최종 답변:")
             print("  " + "-" * 60)
