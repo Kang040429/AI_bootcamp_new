@@ -87,7 +87,7 @@ def call_gemini_api(
                         return json.loads(clean_text)
                     except json.JSONDecodeError:
                         print("❌ [Gemini JSON Error] JSON 파싱 실패:", clean_text)
-                        return get_fallback_response(output_type) 
+                        return get_fallback_response(output_type)
                 
                 return raw_text
 
