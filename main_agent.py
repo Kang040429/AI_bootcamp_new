@@ -16,10 +16,6 @@ from gemini_client import call_gemini_api
 # =====================================================================
 # 🌲 [LightGBM] 저장된 예측 모델 및 Feature Importance 로드
 # =====================================================================
-
-
-# =====================================================================
-# 🔧 [수정] 파일이 있는 현재 위치를 기준으로 절대 경로를 자동 생성합니다.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "lightgbm_pm10_model.pkl")
 
@@ -53,25 +49,12 @@ if lgb_model is not None:
         print(f"⚠️ [LightGBM] 특성 중요도 계산 중 예외 발생: {e}")
 
 
-def predict_pm10_with_explanation(input_data):
+def predict_pm10_with_explanation(air_data: dict) -> dict:
+    """
+    수집된 대기질 결과(SO2, CO, O3, NO2 등)를 LightGBM 모델 입력 형식으로 변환하여 PM10을 예측합니다.
+    """
     model = load_lgbm_model()
-    if model is None:
-        print("⚠️ [LightGBM] 모델이 None이므로 예측을 건너뜁니다.")
-        return None
-        
-    try:
-        # ML 예측 실행
-        prediction = model.predict(input_data)
-        print(f"✅ [LightGBM] 예측 완료: {prediction}")
-        return prediction
-    except Exception as e:
-        # 💡 예측 수행 중 에러가 나는지 확인하기 위해 출력
-        print(f"❌ [LightGBM] predict() 실행 중 에러 발생: {type(e).__name__} - {e}")
-        return None
-    """
-    대기질 수집 결과(SO2, CO, O3, NO2 등)를 LightGBM 모델 입력 형식으로 변환하여 PM10을 예측합니다.
-    """
-    if lgb_model is None:
+    if model is None or not isinstance(air_data, dict):
         return None
 
     try:
@@ -95,7 +78,7 @@ def predict_pm10_with_explanation(input_data):
             '이산화질소(NO2)': no2
         }])
 
-        predicted_pm10 = float(round(lgb_model.predict(input_df)[0], 1))
+        predicted_pm10 = float(round(model.predict(input_df)[0], 1))
 
         top_3_str = "분석 불요"
         if FEATURE_IMPORTANCES:
@@ -116,9 +99,6 @@ def predict_pm10_with_explanation(input_data):
 # 🕸️ [크롤링 모듈] 네이버 실시간 기온, 미세먼지, 초미세, 자외선 수집
 # =====================================================================
 def get_naver_weather_with_numbers(location_name: str) -> dict:
-    """
-    네이버 검색을 통해 [현재 온도, 미세먼지, 초미세먼지, 자외선]을 수치 및 상태로 수집합니다.
-    """
     query = urllib.parse.quote(f"{location_name} 날씨")
     url = f"https://search.naver.com/search.naver?query={query}"
 
@@ -216,10 +196,6 @@ def get_naver_weather_with_numbers(location_name: str) -> dict:
 # 🛡️ [API 예외 시 즉시 크롤링 전환] HTTP 요청 함수
 # =====================================================================
 def safe_requests_get(url: str, params: dict) -> requests.Response:
-    """
-    API 요청 실패 시 대기 및 재시도 없이 즉시 None을 반환하여
-    크롤링 단계로 빠르게 전환되도록 합니다.
-    """
     try:
         res = requests.get(url, params=params, timeout=3)
         if res.status_code == 200:
@@ -376,7 +352,7 @@ def process_user_request(user_input: str) -> dict:
 
 
 # =====================================================================
-# [STEP 2] Fallback 데이터 정의
+# [STEP 2] Fallback 데이터 정의 및 측정소 조회
 # =====================================================================
 def get_fallback_data(station_name="기본측정소", sido="", sigungu="", umd=""):
     print(f"⚠️ [{sido} {sigungu} {umd}] API 및 크롤링 실패로 기본 Fallback 데이터 적용")
@@ -493,9 +469,7 @@ def fetch_air_quality_by_location(location_set: list, location_key: str, air_key
     full_location = f"{sido} {sigungu} {umd_name}".strip()
     raw_air_key = urllib.parse.unquote(air_key) if air_key else ""
 
-    # -------------------------------------------------------------
     # 1️⃣ [1순위] 에어코리아 API 호출 시도
-    # -------------------------------------------------------------
     if location_key and air_key:
         try:
             station_name = get_station_name_cached(sido, sigungu, umd_name, location_key)
@@ -557,9 +531,7 @@ def fetch_air_quality_by_location(location_set: list, location_key: str, air_key
         except Exception as e:
             print(f"⚠️ [API 수집 예외] {e} -> 크롤링으로 직행합니다.")
 
-    # -------------------------------------------------------------
     # 2️⃣ [2순위] API 접속 실패 시 즉시 네이버 크롤링 수행
-    # -------------------------------------------------------------
     print(f"🌐 [크롤링 전환] 네이버에서 '{full_location}' 날씨/대기질 정보 수집 중...")
     crawled = get_naver_weather_with_numbers(full_location)
 
@@ -585,9 +557,7 @@ def fetch_air_quality_by_location(location_set: list, location_key: str, air_key
             "umd": umd_name
         }
 
-    # -------------------------------------------------------------
     # 3️⃣ [3순위] 크롤링까지 실패 시 Fallback 데이터 반환
-    # -------------------------------------------------------------
     return get_fallback_data("기본측정소", sido, sigungu, umd_name)
 
 
